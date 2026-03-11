@@ -6,6 +6,8 @@ Extract data from SQL Server, transform (pass-through), and load into PostgreSQL
 
 import sys
 import os
+import uuid
+import psycopg2
 from typing import List, Dict, Any
 
 # Add src to path for imports
@@ -15,6 +17,7 @@ from src.extract.sql_server_extractor import SQLServerExtractor
 from src.transform.data_transformer import DataTransformer
 from src.load.postgresql_loader import PostgreSQLLoader
 from src.utils.logger import setup_logger
+from config.database_config import DatabaseConfig
 
 class ETLPipeline:
     """Main ETL Pipeline orchestrator"""
@@ -24,6 +27,28 @@ class ETLPipeline:
         self.extractor = SQLServerExtractor()
         self.transformer = DataTransformer()
         self.loader = PostgreSQLLoader()
+
+    def _log_dlt_load(self, load_id: str, status: int, schema_name: str = "oxadatabbase") -> None:
+        """Write ETL run status into _dlt_loads using an isolated connection."""
+        connection = None
+        try:
+            connection = psycopg2.connect(DatabaseConfig.get_postgres_connection_string())
+            connection.autocommit = True
+
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO _dlt_loads (load_id, schema_name, status, inserted_at)
+                    VALUES (%s, %s, %s, NOW())
+                    """,
+                    (load_id, schema_name, status)
+                )
+            self.logger.info(f"Logged ETL run in _dlt_loads with load_id={load_id}, status={status}")
+        except Exception as e:
+            self.logger.error(f"Failed to log ETL run in _dlt_loads: {str(e)}")
+        finally:
+            if connection:
+                connection.close()
     
     def test_extract(self, queries: List[str]) -> bool:
         """
@@ -79,6 +104,7 @@ class ETLPipeline:
         Returns:
             bool: True if successful, False otherwise
         """
+        load_id = str(uuid.uuid4())
         try:
             self.logger.info("Starting ETL Pipeline")
             
@@ -107,13 +133,16 @@ class ETLPipeline:
                 )
             
             if success:
+                self._log_dlt_load(load_id, status=0)
                 self.logger.info("ETL Pipeline completed successfully!")
                 return True
             else:
+                self._log_dlt_load(load_id, status=1)
                 self.logger.error("ETL Pipeline failed during load stage")
                 return False
                 
         except Exception as e:
+            self._log_dlt_load(load_id, status=1)
             self.logger.error(f"ETL Pipeline failed: {str(e)}")
             return False
     
@@ -135,6 +164,7 @@ class ETLPipeline:
         Returns:
             bool: True if successful, False otherwise
         """
+        load_id = str(uuid.uuid4())
         try:
             self.logger.info("Starting ETL Pipeline with Column Mapping")
             
@@ -166,13 +196,16 @@ class ETLPipeline:
                 )
             
             if success:
+                self._log_dlt_load(load_id, status=0)
                 self.logger.info("ETL Pipeline with Column Mapping completed successfully!")
                 return True
             else:
+                self._log_dlt_load(load_id, status=1)
                 self.logger.error("ETL Pipeline failed during load stage")
                 return False
                 
         except Exception as e:
+            self._log_dlt_load(load_id, status=1)
             self.logger.error(f"ETL Pipeline failed: {str(e)}")
             return False
 
