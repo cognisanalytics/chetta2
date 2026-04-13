@@ -126,7 +126,7 @@ python main.py
 
 Logs are written to:
 - Console: INFO level and above
-- File: `etl_YYYYMMDD.log` with DEBUG level and above
+- File: `logs/etl_YYYYMMDD_HHMMSS.log` (one file per run; DEBUG level and above)
 
 ## Dependencies
 

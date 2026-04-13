@@ -1,3 +1,5 @@
+import warnings
+
 import pyodbc
 import pandas as pd
 from typing import List, Dict, Any, Optional
@@ -16,6 +18,8 @@ class SQLServerExtractor:
         """Establish connection to SQL Server"""
         try:
             self.connection = pyodbc.connect(self.connection_string)
+            # Apply per-statement timeout at connection level.
+            self.connection.timeout = DatabaseConfig.QUERY_TIMEOUT
             self.logger.info("Successfully connected to SQL Server")
             return True
         except Exception as e:
@@ -37,11 +41,17 @@ class SQLServerExtractor:
             
             self.logger.info(f"Executing query: {query[:100]}...")
             
-            # Execute query with parameters if provided
-            if params:
-                df = pd.read_sql(query, self.connection, params=params)
-            else:
-                df = pd.read_sql(query, self.connection)
+            # pandas warns on non-SQLAlchemy DBAPI connections; pyodbc is fine here.
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="pandas only supports SQLAlchemy connectable",
+                    category=UserWarning,
+                )
+                if params:
+                    df = pd.read_sql(query, self.connection, params=params)
+                else:
+                    df = pd.read_sql(query, self.connection)
             
             self.logger.info(f"Query executed successfully. Retrieved {len(df)} rows")
             return df

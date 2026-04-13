@@ -2,6 +2,7 @@ import psycopg2
 import pandas as pd
 from typing import List, Dict, Any, Optional
 from psycopg2.extras import execute_values
+from psycopg2 import sql
 from config.database_config import DatabaseConfig
 from src.utils.logger import setup_logger
 
@@ -15,7 +16,135 @@ class PostgreSQLLoader:
         self.cursor = None
         self.batch_size = DatabaseConfig.BATCH_SIZE
         self.max_retries = DatabaseConfig.MAX_RETRIES
-    
+        self.load_progress_log_interval = DatabaseConfig.LOAD_PROGRESS_LOG_INTERVAL
+        self.default_schema = DatabaseConfig.POSTGRES_SCHEMA
+
+    def _split_table_name(self, table_name: str) -> tuple[str, str]:
+        """Return (schema, table) from table_name or fallback to default schema."""
+        cleaned = table_name.strip()
+        if "." in cleaned:
+            schema, table = cleaned.split(".", 1)
+            return schema.strip(), table.strip()
+        return self.default_schema, cleaned
+
+    def _qualified_table_identifier(self, table_name: str) -> sql.Composed:
+        schema, table = self._split_table_name(table_name)
+        return sql.SQL("{}.{}").format(sql.Identifier(schema), sql.Identifier(table))
+
+    def _table_exists(self, table_name: str) -> bool:
+        schema, table = self._split_table_name(table_name)
+        self.cursor.execute(
+            """
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = %s AND table_name = %s
+            LIMIT 1
+            """,
+            (schema, table),
+        )
+        return self.cursor.fetchone() is not None
+
+    @staticmethod
+    def _map_pd_dtype_to_pg(dtype: Any) -> str:
+        """Map pandas dtypes to PostgreSQL column types."""
+        if pd.api.types.is_bool_dtype(dtype):
+            return "BOOLEAN"
+        if pd.api.types.is_integer_dtype(dtype):
+            return "BIGINT"
+        if pd.api.types.is_float_dtype(dtype):
+            return "DOUBLE PRECISION"
+        if pd.api.types.is_datetime64_any_dtype(dtype):
+            return "TIMESTAMP"
+        return "TEXT"
+
+    def _ensure_table_exists(self, df: pd.DataFrame, table_name: str) -> None:
+        """Create schema/table if missing using inferred column types."""
+        schema, _ = self._split_table_name(table_name)
+        self.cursor.execute(
+            sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema))
+        )
+
+        if self._table_exists(table_name):
+            return
+
+        if df.empty and len(df.columns) == 0:
+            raise ValueError(f"Cannot create table {table_name}: DataFrame has no columns")
+
+        column_defs = []
+        for column in df.columns:
+            pg_type = self._map_pd_dtype_to_pg(df[column].dtype)
+            column_defs.append(
+                sql.SQL("{} {}").format(sql.Identifier(str(column)), sql.SQL(pg_type))
+            )
+
+        create_query = sql.SQL("CREATE TABLE {} ({})").format(
+            self._qualified_table_identifier(table_name),
+            sql.SQL(", ").join(column_defs),
+        )
+        self.cursor.execute(create_query)
+        self.logger.info(f"Created missing table {table_name}")
+
+    def _recreate_table(self, df: pd.DataFrame, table_name: str) -> None:
+        """
+        Recreate destination table from source DataFrame schema.
+        This keeps the pipeline simple and avoids conflicts with pre-existing
+        dlt metadata columns/constraints.
+        """
+        schema, _ = self._split_table_name(table_name)
+        self.cursor.execute(
+            sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema))
+        )
+
+        drop_query = sql.SQL("DROP TABLE IF EXISTS {}").format(
+            self._qualified_table_identifier(table_name)
+        )
+        self.cursor.execute(drop_query)
+
+        if len(df.columns) == 0:
+            raise ValueError(f"Cannot create table {table_name}: DataFrame has no columns")
+
+        column_defs = []
+        for column in df.columns:
+            pg_type = self._map_pd_dtype_to_pg(df[column].dtype)
+            column_defs.append(
+                sql.SQL("{} {}").format(sql.Identifier(str(column)), sql.SQL(pg_type))
+            )
+
+        create_query = sql.SQL("CREATE TABLE {} ({})").format(
+            self._qualified_table_identifier(table_name),
+            sql.SQL(", ").join(column_defs),
+        )
+        self.cursor.execute(create_query)
+        self.logger.info(f"Recreated table {table_name}")
+
+    @staticmethod
+    def _clean_dataframe_for_insert(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Replace pandas NaN/NaT with Python None for psycopg2 inserts.
+        """
+        if df.empty:
+            return df
+        # Convert to object first so None is preserved (avoids datetime columns
+        # coercing None back to pandas NaT, which Postgres rejects as "NaT").
+        cleaned = df.copy().astype(object)
+        cleaned = cleaned.where(pd.notna(cleaned), None)
+        # Defensive fallback for object/string values that may still carry NaT text.
+        cleaned = cleaned.replace({"NaT": None})
+        return cleaned
+
+    def _log_load_progress_if_due(
+        self, processed_rows: int, total_rows: int, last_logged_rows: int
+    ) -> int:
+        """Log batch progress at most every load_progress_log_interval rows (or every batch if interval is 0)."""
+        interval = self.load_progress_log_interval
+        if interval <= 0 or processed_rows == total_rows:
+            self.logger.info("Processed %s/%s rows", processed_rows, total_rows)
+            return processed_rows
+        if processed_rows - last_logged_rows >= interval:
+            self.logger.info("Processed %s/%s rows", processed_rows, total_rows)
+            return processed_rows
+        return last_logged_rows
+
     def connect(self) -> bool:
         """Establish connection to PostgreSQL"""
         try:
@@ -43,26 +172,26 @@ class PostgreSQLLoader:
                     raise Exception("Could not establish database connection")
             
             self.logger.info(f"Starting delete and insert for table {table_name} with {len(df)} rows")
-            
-            # Delete all data from table
-            delete_query = f"DELETE FROM {table_name}"
-            self.cursor.execute(delete_query)
-            self.logger.info(f"Deleted all existing data from {table_name}")
+            # Keep behavior deterministic and simple: always recreate table.
+            self._recreate_table(df, table_name)
             
             # Prepare data for insertion
-            columns = list(df.columns)
-            values = [tuple(row) for row in df.values]
+            cleaned_df = self._clean_dataframe_for_insert(df)
+            columns = list(cleaned_df.columns)
+            values = [tuple(row) for row in cleaned_df.values]
             
             # Build insert query
-            insert_query = f"""
-                INSERT INTO {table_name} ({", ".join(columns)})
-                VALUES %s
-            """
+            quoted_columns = sql.SQL(", ").join([sql.Identifier(str(col)) for col in columns])
+            insert_query = sql.SQL("INSERT INTO {} ({}) VALUES %s").format(
+                self._qualified_table_identifier(table_name),
+                quoted_columns,
+            ).as_string(self.connection)
             
             # Execute insert in batches
             total_rows = len(values)
             processed_rows = 0
-            
+            last_logged_rows = 0
+
             for i in range(0, total_rows, self.batch_size):
                 batch_values = values[i:i + self.batch_size]
                 
@@ -76,7 +205,9 @@ class PostgreSQLLoader:
                     )
                     
                     processed_rows += len(batch_values)
-                    self.logger.info(f"Processed {processed_rows}/{total_rows} rows")
+                    last_logged_rows = self._log_load_progress_if_due(
+                        processed_rows, total_rows, last_logged_rows
+                    )
                     
                 except Exception as e:
                     self.logger.error(f"Error processing batch {i//self.batch_size + 1}: {str(e)}")
@@ -130,7 +261,8 @@ class PostgreSQLLoader:
             # Execute upsert in batches
             total_rows = len(values)
             processed_rows = 0
-            
+            last_logged_rows = 0
+
             for i in range(0, total_rows, self.batch_size):
                 batch_values = values[i:i + self.batch_size]
                 
@@ -144,7 +276,9 @@ class PostgreSQLLoader:
                     )
                     
                     processed_rows += len(batch_values)
-                    self.logger.info(f"Processed {processed_rows}/{total_rows} rows")
+                    last_logged_rows = self._log_load_progress_if_due(
+                        processed_rows, total_rows, last_logged_rows
+                    )
                     
                 except Exception as e:
                     self.logger.error(f"Error processing batch {i//self.batch_size + 1}: {str(e)}")

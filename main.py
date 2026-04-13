@@ -7,8 +7,10 @@ Extract data from SQL Server, transform (pass-through), and load into PostgreSQL
 import sys
 import os
 import uuid
+import argparse
 import psycopg2
-from typing import List, Dict, Any
+from psycopg2 import sql
+from typing import List, Dict, Any, Tuple
 
 # Add src to path for imports
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
@@ -19,6 +21,83 @@ from src.load.postgresql_loader import PostgreSQLLoader
 from src.utils.logger import setup_logger
 from config.database_config import DatabaseConfig
 
+DEFAULT_SOURCE_DATABASE = "Chetta"
+DEFAULT_SOURCE_SCHEMA = "dbo"
+SOURCE_TABLES = [
+    "Chetta.dbo.consArticulos",
+    "Chetta.dbo.consAutSalidas",
+    "Chetta.dbo.consClientes",
+    "Chetta.dbo.consCotizacion",
+    "Chetta.dbo.consEmpleados",
+    "Chetta.dbo.consFeriados",
+    "Chetta.dbo.consGrados",
+    "Chetta.dbo.consHistClinicas",
+    "Chetta.dbo.consItemsFac",
+    "Chetta.dbo.consLegajos",
+    "Chetta.dbo.consMarcas",
+    "Chetta.dbo.consModelos",
+    "Chetta.dbo.consOrdTrabajo",
+    "Chetta.dbo.consPtoVenta",
+    "Chetta.dbo.consTrabajos",
+    "Chetta.dbo.consTrafico",
+    "Chetta.dbo.consTurnos",
+    "Chetta.dbo.consVenDetArt",
+    "Chetta.dbo.consVenDetItm",
+    "Chetta.dbo.consVenKit",
+    "Chetta.dbo.consVentas",
+]
+
+
+def parse_source_table_identifier(table_identifier: str) -> Tuple[str, str, str]:
+    """
+    Parse SQL Server table identifier into database, schema, table.
+    Supports:
+    - database.schema.table (preferred)
+    - schema.table
+    - table
+    """
+    parts = [p.strip() for p in table_identifier.split(".") if p.strip()]
+    if len(parts) == 3:
+        return parts[0], parts[1], parts[2]
+    if len(parts) == 2:
+        return DEFAULT_SOURCE_DATABASE, parts[0], parts[1]
+    if len(parts) == 1:
+        return DEFAULT_SOURCE_DATABASE, DEFAULT_SOURCE_SCHEMA, parts[0]
+    raise ValueError(f"Invalid source table identifier: {table_identifier}")
+
+
+def build_select_query(table_identifier: str) -> str:
+    """Build safe SQL Server SELECT * query with bracketed identifiers."""
+    database, schema, table = parse_source_table_identifier(table_identifier)
+    return f"SELECT * FROM [{database}].[{schema}].[{table}]"
+
+
+def build_target_table_name(table_identifier: str) -> str:
+    """Use source table name as lowercase PostgreSQL target table name."""
+    _, _, table = parse_source_table_identifier(table_identifier)
+    return table.lower()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Extract Chetta SQL Server tables and load into PostgreSQL"
+    )
+    parser.add_argument(
+        "--extract-only",
+        action="store_true",
+        help="Only test extraction from SQL Server, no PostgreSQL load",
+    )
+    parser.add_argument(
+        "--tables",
+        nargs="+",
+        help=(
+            "Optional list of tables to process (accepts full name like "
+            "Chetta.dbo.consVentas or short name like consVentas)"
+        ),
+    )
+    return parser.parse_args()
+
+
 class ETLPipeline:
     """Main ETL Pipeline orchestrator"""
     
@@ -28,20 +107,40 @@ class ETLPipeline:
         self.transformer = DataTransformer()
         self.loader = PostgreSQLLoader()
 
-    def _log_dlt_load(self, load_id: str, status: int, schema_name: str = "oxadatabbase") -> None:
+    def _log_dlt_load(self, load_id: str, status: int, schema_name: str = None) -> None:
         """Write ETL run status into _dlt_loads using an isolated connection."""
         connection = None
         try:
+            if schema_name is None:
+                schema_name = DatabaseConfig.POSTGRES_SCHEMA
+
             connection = psycopg2.connect(DatabaseConfig.get_postgres_connection_string())
             connection.autocommit = True
 
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    INSERT INTO _dlt_loads (load_id, schema_name, status, inserted_at)
-                    VALUES (%s, %s, %s, NOW())
+                    SELECT 1
+                    FROM information_schema.tables
+                    WHERE table_schema = %s
+                      AND table_name = '_dlt_loads'
+                    LIMIT 1
                     """,
-                    (load_id, schema_name, status)
+                    (schema_name,),
+                )
+                if cursor.fetchone() is None:
+                    self.logger.info(
+                        "Skipping _dlt_loads logging because %s._dlt_loads does not exist",
+                        schema_name,
+                    )
+                    return
+
+                cursor.execute(
+                    sql.SQL(
+                        "INSERT INTO {}._dlt_loads (load_id, schema_name, status, inserted_at) "
+                        "VALUES (%s, %s, %s, NOW())"
+                    ).format(sql.Identifier(schema_name)),
+                    (load_id, schema_name, status),
                 )
             self.logger.info(f"Logged ETL run in _dlt_loads with load_id={load_id}, status={status}")
         except Exception as e:
@@ -178,22 +277,22 @@ class ETLPipeline:
             if len(queries) != len(column_mappings):
                 raise ValueError("Number of queries must match number of column mappings")
             
-            # Stage 1: Extract
-            self.logger.info("=== STAGE 1: EXTRACT ===")
-            with self.extractor as extractor:
-                extracted_data = extractor.execute_batch_queries(queries)
-            
-            # Stage 2: Transform with column mapping and boolean conversion
-            self.logger.info("=== STAGE 2: TRANSFORM ===")
-            transformed_data = self.transformer.transform_batch(extracted_data, column_mappings)
-            
-            # Stage 3: Load
-            self.logger.info("=== STAGE 3: LOAD ===")
-            with self.loader as loader:
-                success = loader.delete_and_insert_batch(
-                    transformed_data, 
-                    table_names
-                )
+            # Simple and memory-safe mode: process one table at a time.
+            success = True
+            with self.extractor as extractor, self.loader as loader:
+                for i, (query, table_name) in enumerate(zip(queries, table_names), start=1):
+                    self.logger.info("=== TABLE %s/%s: %s ===", i, len(table_names), table_name)
+                    self.logger.info("=== STAGE 1: EXTRACT ===")
+                    extracted_df = extractor.execute_query(query)
+
+                    self.logger.info("=== STAGE 2: TRANSFORM ===")
+                    mapping = column_mappings[i - 1] if i - 1 < len(column_mappings) else {}
+                    transformed_df = self.transformer.transform_data(extracted_df, mapping)
+
+                    self.logger.info("=== STAGE 3: LOAD ===")
+                    if not loader.delete_and_insert_data(transformed_df, table_name):
+                        success = False
+                        break
             
             if success:
                 self._log_dlt_load(load_id, status=0)
@@ -210,187 +309,47 @@ class ETLPipeline:
             return False
 
 def main():
-    """Main function with example usage - SQL Server Extract Test Only"""
+    """Main function for Chetta table extraction and load."""
     logger = setup_logger("main")
-    
-    # Example configuration - replace with your actual queries
-    queries = [
-        "SELECT COD_VENDED, NOMBRE_VEN, INHABILITA FROM GVA23", # Codigo vendedor, nombre vendedor, activo
-        "SELECT COD_CLIENT, RAZON_SOCI, HABILITADO, LOCALIDAD FROM GVA14", # Codigo cliente, Nombre, Activo, Departamento
-        "SELECT COD_ARTICU, DESCRIPCIO, CA_967_ESTADO, CA_967_FAMILIA, CA_967_LINEA FROM STA11", # Codigo producto, Nombre producto, Activo, Familia producto, Categoría producto
-        """SELECT 
-	GVA12.FECHA_EMIS AS [FECHA_EMISION] ,
-	GVA53.T_COMP AS [TIPO_COMPROBANTE] ,
-	GVA53.N_COMP AS [NRO_COMPROBANTE] ,
-	GVA12.COD_VENDED AS [COD_VENDEDOR] ,
-	CASE GVA12.COD_VENDED WHEN '**' THEN 'CARGA INICIAL' ELSE GVA23.NOMBRE_VEN END AS [NOMBRE_VENDEDOR] ,
-	COALESCE(CLI2.COD_CLIENT,CLI3.COD_CLIENT, GVA12.COD_CLIENT) AS [COD_CLIENTE] ,
-	COALESCE(CLI2.RAZON_SOCI,CLI3.RAZON_SOCI, GVA14.RAZON_SOCI) AS [RAZON_SOCIAL] ,
-	GVA14.LOCALIDAD AS [LOCALIDAD] ,
-	GVA53.COD_ARTICU AS [COD_ARTICULO] ,
-	STA11.DESCRIPCIO AS [DESCRIPCION] ,
-	SUM(CASE WHEN GVA12.T_COMP <> 'FAC' AND GVA15.TIPO_COMP = 'C' THEN (-1) ELSE (1) END * GVA53.CANTIDAD) AS [CANTIDAD] ,
-	GVA53.PRECIO_PAN AS [PRECIO_UNITARIO] ,
-	SUM( CASE WHEN GVA12.T_COMP <> 'FAC' AND GVA15.TIPO_COMP = 'C' THEN (-1) ELSE (1) END * CASE 'BIMONCTE' WHEN 'BIMONCTE' THEN (CASE GVA12.MON_CTE WHEN 1 THEN CASE 'NO' WHEN 'NO' THEN (GVA53.PRECIO_NET * GVA53.CANTIDAD) ELSE (GVA53.PRECIO_NET * GVA53.CANTIDAD) - ((GVA53.PRECIO_NET * GVA53.CANTIDAD) * GVA12.PORC_BONIF/100) + ((GVA53.PRECIO_NET * GVA53.CANTIDAD) * GVA12.PORC_FLE/100) + ((GVA53.PRECIO_NET * GVA53.CANTIDAD) * GVA12.PORC_REC/100) END 			 ELSE CASE 'NO' WHEN 'NO' THEN (GVA53.PRECIO_NET * GVA53.CANTIDAD) * GVA12.COTIZ ELSE ((GVA53.PRECIO_NET * GVA53.CANTIDAD) - ((GVA53.PRECIO_NET * GVA53.CANTIDAD) * GVA12.PORC_BONIF/100) + ((GVA53.PRECIO_NET * GVA53.CANTIDAD) * GVA12.PORC_FLE/100) + ((GVA53.PRECIO_NET * GVA53.CANTIDAD) * GVA12.PORC_REC/100)) * GVA12.COTIZ END END) WHEN 'BIORIGEN' THEN (CASE GVA12.MON_CTE WHEN 1 THEN CASE GVA12.COTIZ WHEN 0 THEN 0 ELSE CASE 'NO' WHEN 'NO' THEN (GVA53.PRECIO_NET * GVA53.CANTIDAD) / GVA12.COTIZ ELSE ((GVA53.PRECIO_NET * GVA53.CANTIDAD) - ((GVA53.PRECIO_NET * GVA53.CANTIDAD) * GVA12.PORC_BONIF/100) + ((GVA53.PRECIO_NET * GVA53.CANTIDAD) * GVA12.PORC_FLE/100) + ((GVA53.PRECIO_NET * GVA53.CANTIDAD) * GVA12.PORC_REC/100)) / GVA12.COTIZ END 				 END 				 ELSE CASE 'NO' WHEN 'NO' THEN (GVA53.PRECIO_NET * GVA53.CANTIDAD) ELSE (GVA53.PRECIO_NET * GVA53.CANTIDAD) - ((GVA53.PRECIO_NET * GVA53.CANTIDAD) * GVA12.PORC_BONIF/100) + ((GVA53.PRECIO_NET * GVA53.CANTIDAD) * GVA12.PORC_FLE/100) + ((GVA53.PRECIO_NET * GVA53.CANTIDAD)* GVA12.PORC_REC/100) END END) WHEN 'BICOTIZ' THEN (CASE GVA12.MON_CTE WHEN 1 THEN CASE 'NO' WHEN 'NO' THEN (GVA53.PRECIO_NET * GVA53.CANTIDAD) / 1 ELSE ((GVA53.PRECIO_NET * GVA53.CANTIDAD) - ((GVA53.PRECIO_NET * GVA53.CANTIDAD) * GVA12.PORC_BONIF/100) + ((GVA53.PRECIO_NET * GVA53.CANTIDAD) * GVA12.PORC_FLE/100) + ((GVA53.PRECIO_NET * GVA53.CANTIDAD) * GVA12.PORC_REC/100)) / 1 END ELSE CASE 'NO' WHEN 'NO' THEN (GVA53.PRECIO_NET * GVA53.CANTIDAD) * GVA12.COTIZ / 1 ELSE ((GVA53.PRECIO_NET * GVA53.CANTIDAD) - ((GVA53.PRECIO_NET * GVA53.CANTIDAD) * GVA12.PORC_BONIF/100) + ((GVA53.PRECIO_NET * GVA53.CANTIDAD) * GVA12.PORC_FLE/100) + ((GVA53.PRECIO_NET * GVA53.CANTIDAD) * GVA12.PORC_REC/100)) * GVA12.COTIZ / 1 END END) END ) AS [TOTAL] ,
-	gva53.PORC_DTO AS [DESC_LINEA],
-	gva12.PORC_BONIF as [DESC_ENCABEZ],
-	ISNULL(CLASIF_CLI.IDFOLDER, '') AS [ID_FOLDER_CLIENTES] ,
-	ISNULL(CLASIF_CLI.PADRE0, '') AS [CLI_CARPETA_NIVEL_1] ,
-	(CASE WHEN CHARINDEX('<CA_967_FAMILIA>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) = 0 THEN '' ELSE (SUBSTRING( CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX)),CHARINDEX('<CA_967_FAMILIA>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) + LEN('<CA_967_FAMILIA>'),CHARINDEX('</CA_967_FAMILIA>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) - (CHARINDEX('<CA_967_FAMILIA>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) + LEN('<CA_967_FAMILIA>')))) END) AS [FAMILIA_ADIC] ,
-	(CASE WHEN CHARINDEX('<CA_967_ESTADO>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) = 0 THEN '' ELSE (SUBSTRING( CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX)),CHARINDEX('<CA_967_ESTADO>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) + LEN('<CA_967_ESTADO>'),CHARINDEX('</CA_967_ESTADO>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) - (CHARINDEX('<CA_967_ESTADO>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) + LEN('<CA_967_ESTADO>')))) END) AS [ESTADO_ADIC] ,
-	(CASE WHEN CHARINDEX('<CA_967_LINEA>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) = 0 THEN '' ELSE (SUBSTRING( CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX)),CHARINDEX('<CA_967_LINEA>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) + LEN('<CA_967_LINEA>'),CHARINDEX('</CA_967_LINEA>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) - (CHARINDEX('<CA_967_LINEA>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) + LEN('<CA_967_LINEA>')))) END) AS [LINEA_ADIC] ,
-	(CASE WHEN CHARINDEX('<CA_967_GRUPO>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) = 0 THEN '' ELSE (SUBSTRING( CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX)),CHARINDEX('<CA_967_GRUPO>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) + LEN('<CA_967_GRUPO>'),CHARINDEX('</CA_967_GRUPO>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) - (CHARINDEX('<CA_967_GRUPO>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) + LEN('<CA_967_GRUPO>')))) END) AS [GRUPO_ADIC],
-	GVA12.LEYENDA_1 AS [LEYENDA_1],GVA12.LEYENDA_2 AS [LEYENDA_2],GVA12.LEYENDA_3 AS [LEYENDA_3], GVA12.LEYENDA_4 AS [LEYENDA_4],
-	CASE
-		WHEN NOT CLI2.COD_CLIENT IS NULL OR NOT CLI3.COD_CLIENT IS NULL THEN GVA14.RAZON_SOCI
-	END AS [RAZON_SOCIAL_FACTURACION],
-	GVA21.LEYENDA_5 AS [LEY_GVA21],
-	PED2.LEYENDA_5 as [LEY_GVA21_X_GVA55],
-	GVA21.NRO_PEDIDO,
-	PED2.NRO_PEDIDO AS PED_NRO
-	
-FROM 
-GVA12 (NOLOCK) 
-	INNER JOIN GVA53 (NOLOCK) ON 
-		GVA53.T_COMP = GVA12.T_COMP AND GVA53.N_COMP = GVA12.N_COMP 
-	INNER JOIN GVA23 (NOLOCK) ON 
-		GVA12.COD_VENDED = GVA23.COD_VENDED
-	LEFT JOIN GVA14 (NOLOCK) ON 
-		GVA12.COD_CLIENT = GVA14.COD_CLIENT
-	LEFT JOIN STA11 (NOLOCK) ON 
-		GVA53.COD_ARTICU = STA11.COD_ARTICU
-	LEFT JOIN GVA15 ON 
-		GVA15.IDENT_COMP = GVA12.T_COMP
-	LEFT JOIN (SELECT 
-					N1.CODE, 
-					N1.IDFOLDER, 
-					F1.PADRE0, 
-					F1.PADRE1, 
-					F1.PADRE2, 
-					F1.PADRE3, 
-					F1.PADRE4, 
-					F1.PADRE5, 
-					F1.PADRE6, 
-					F1.PADRE7, 
-					F1.PADRE8, 
-					F1.PADRE9, 
-					F1.PADRE10, 
-					F1.PADRE11 
-				FROM 
-					GVA14ITC N1 
-						JOIN V_LI_CLASIFICADOR_GVA14FLD F1 
-							ON (N1.IDFOLDER= F1.IDFOLDER_V) ) AS CLASIF_CLI ON 
-		GVA12.COD_CLIENT = CLASIF_CLI.CODE
-	LEFT JOIN 
-		(SELECT	DISTINCT
-			TCOMP_V,
-			NCOMP_V,
-			TALON_PED,
-			NRO_PEDIDO
-		FROM
-			GVA107)	GVA107
-		ON GVA12.T_COMP=GVA107.TCOMP_V
-		AND GVA12.N_COMP=GVA107.NCOMP_V
-	LEFT JOIN GVA21
-		ON GVA107.TALON_PED=GVA21.TALON_PED
-		AND GVA107.NRO_PEDIDO=GVA21.NRO_PEDIDO
-	LEFT JOIN GVA14 CLI2
-		ON GVA21.LEYENDA_5=CLI2.COD_CLIENT
-	LEFT JOIN GVA55
-		ON GVA12.T_COMP=GVA55.T_COMP
-		AND GVA12.N_COMP=GVA55.N_COMP
-	LEFT JOIN GVA21 PED2
-		ON GVA55.TALON_PED=PED2.TALON_PED
-		AND GVA55.NRO_PEDIDO=PED2.NRO_PEDIDO
-	LEFT JOIN GVA14 CLI3
-		ON PED2.LEYENDA_5=CLI3.COD_CLIENT
-		
-WHERE 
-	(GVA53.COD_ARTICU <> 'ART. AJUSTE') AND (GVA53.COD_ARTICU <> '')
-	AND 
-	( (GVA12.FECHA_EMIS BETWEEN '01/01/2022' AND '31/01/2030')) 
-	AND (GVA53.RENGL_PADR = 0 OR GVA53.INSUMO_KIT_SEPARADO =1)
-GROUP BY 
-	GVA12.FECHA_EMIS , 
-	GVA53.T_COMP , 
-	GVA53.N_COMP , 
-	GVA12.COD_VENDED , 
-	CASE GVA12.COD_VENDED WHEN '**' THEN 'CARGA INICIAL' ELSE GVA23.NOMBRE_VEN END , 
-	GVA12.COD_CLIENT , 
-	CASE GVA12.COD_CLIENT WHEN '000000' THEN 'OCASIONAL' ELSE GVA14.RAZON_SOCI END , 
-	GVA14.COD_CLIENT,
-	CLI2.COD_CLIENT,
-	CLI2.RAZON_SOCI,
-	CLI3.COD_CLIENT,
-	CLI3.RAZON_SOCI,
-	GVA14.RAZON_SOCI,
-	GVA14.LOCALIDAD , 
-	GVA53.COD_ARTICU , 
-	STA11.DESCRIPCIO , 
-	GVA53.PRECIO_PAN ,
-	gva53.PORC_DTO,
-	gva12.PORC_BONIF,
-	ISNULL(CLASIF_CLI.IDFOLDER, '') , 
-	ISNULL(CLASIF_CLI.PADRE0, '') ,
-	(CASE WHEN CHARINDEX('<CA_967_FAMILIA>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) = 0 THEN '' ELSE 
-(SUBSTRING( CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX)),CHARINDEX('<CA_967_FAMILIA>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) + LEN('<CA_967_FAMILIA>'),
-CHARINDEX('</CA_967_FAMILIA>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) - (CHARINDEX('<CA_967_FAMILIA>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) + LEN('<CA_967_FAMILIA>')))) END) ,
-(CASE WHEN CHARINDEX('<CA_967_ESTADO>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) = 0 THEN '' ELSE (SUBSTRING( CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX)),CHARINDEX('<CA_967_ESTADO>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) + LEN('<CA_967_ESTADO>'),
-CHARINDEX('</CA_967_ESTADO>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) - (CHARINDEX('<CA_967_ESTADO>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) + LEN('<CA_967_ESTADO>')))) END) ,
-(CASE WHEN CHARINDEX('<CA_967_LINEA>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) = 0 THEN '' ELSE (SUBSTRING( CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX)),
-CHARINDEX('<CA_967_LINEA>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) + LEN('<CA_967_LINEA>'),CHARINDEX('</CA_967_LINEA>', 
-CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) - (CHARINDEX('<CA_967_LINEA>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) + LEN('<CA_967_LINEA>')))) END) , 
-(CASE WHEN CHARINDEX('<CA_967_GRUPO>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) = 0 THEN '' ELSE (SUBSTRING( CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX)),
-CHARINDEX('<CA_967_GRUPO>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) + LEN('<CA_967_GRUPO>'),
-CHARINDEX('</CA_967_GRUPO>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) - (CHARINDEX('<CA_967_GRUPO>', CAST(STA11.CAMPOS_ADICIONALES AS NVARCHAR(MAX))) + LEN('<CA_967_GRUPO>')))) END),
-GVA12.LEYENDA_1,GVA12.LEYENDA_2,GVA12.LEYENDA_3, GVA12.LEYENDA_4,GVA12.LEYENDA_5,
-gva21.leyenda_5, ped2.LEYENDA_5,GVA21.NRO_PEDIDO, PED2.NRO_PEDIDO""", # Complex sales detail query
-        "SELECT * FROM SEIN_COTIZACIONES",  # Cotizaciones / Tipo de cambio
-    ]
-    
-    # PostgreSQL table names
-    table_names = [
-        "Vendedores",  # GVA23 → Vendedores
-        "Clientes",    # GVA14 → Clientes  
-        "Producto",    # STA11 → Producto
-        "Ventas_Detalle",  # Complex sales query → Ventas_Detalle
-        "Cotizaciones"     # SEIN_COTIZACIONES → Cotizaciones
-    ]
-    
-    # Primary key columns for upsert conflicts
-    conflict_columns_list = [
-        ["COD_VENDED"],  # Primary key for Vendedores
-        ["COD_CLIENT"],  # Primary key for Clientes
-        ["COD_ARTICU"],  # Primary key for Producto
-        ["Id"],  # Auto-increment primary key for Ventas_Detalle
-        []       # No conflict columns for Cotizaciones (delete + insert)
-    ]
-    
-    # Column mappings from SQL Server to PostgreSQL (no mapping needed - using original column names)
-    column_mappings = [
-        {},  # No column mapping needed for Vendedores - column names already match
-        {},  # No column mapping needed for Clientes - column names already match
-        {},  # No column mapping needed for Producto - column names already match
-        {},  # No column mapping needed for Ventas_Detalle - column names already match
-        {}   # No column mapping needed for Cotizaciones
-    ]
-    
-    # Columns to update on conflict (all columns except primary key)
-    update_columns_list = [
-        ["NOMBRE_VEN", "INHABILITA"],                           # Vendedores: update NOMBRE_VEN, INHABILITA
-        ["RAZON_SOCI", "HABILITADO", "LOCALIDAD", "COD_PROVIN", "COD_VENDED", "FECHA_ALTA"],  # Clientes: update all columns except COD_CLIENT
-        ["DESCRIPCIO", "CA_967_ESTADO", "CA_967_FAMILIA", "CA_967_LINEA", "CA_967_GRUPO", "FECHA_ALTA"],  # Producto: update all columns except COD_ARTICU
-        ["Fecha_Emision", "Tipo_Comprobante", "Nro_Comprobante", "Cod_Vendedor", "Nombre_Vendedor", "Cod_Cliente", "Razon_Social", "Localidad", "Cod_Articulo", "Descripcion", "Cantidad", "Precio_Unitario", "Total", "Desc_Linea", "Desc_Encabez", "Id_Folder_Clientes", "Cli_Carpeta_Nivel_1", "Familia_Adic", "Estado_Adic", "Linea_Adic", "Grupo_Adic", "Leyenda_1", "Leyenda_2", "Leyenda_3", "Leyenda_4", "Razon_Social_Facturacion", "Ley_Gva21", "Ley_Gva21_X_Gva55", "Nro_Pedido", "Ped_Nro"],  # Ventas_Detalle: update all columns except Id
-        []  # No update columns for Cotizaciones (delete + insert)
-    ]
-    
-    # Choose which method to run:
-    # Option 1: Test extraction only
+    args = parse_args()
+
+    selected_source_tables = SOURCE_TABLES
+    if args.tables:
+        requested = {table.lower() for table in args.tables}
+        selected_source_tables = [
+            table for table in SOURCE_TABLES
+            if table.lower() in requested or table.split(".")[-1].lower() in requested
+        ]
+        missing = sorted(
+            requested - {t.lower() for t in selected_source_tables} - {t.split(".")[-1].lower() for t in selected_source_tables}
+        )
+        if missing:
+            logger.warning("Requested tables not found in SOURCE_TABLES: %s", ", ".join(missing))
+
+    if not selected_source_tables:
+        logger.error("No source tables selected. Exiting.")
+        sys.exit(1)
+
+    queries = [build_select_query(table_name) for table_name in selected_source_tables]
+    table_names = [build_target_table_name(table_name) for table_name in selected_source_tables]
+    conflict_columns_list = [[] for _ in selected_source_tables]
+    column_mappings = [{} for _ in selected_source_tables]
+    update_columns_list = [[] for _ in selected_source_tables]
+
+    logger.info("Selected %s Chetta table(s): %s", len(selected_source_tables), ", ".join(selected_source_tables))
+    logger.info("Target PostgreSQL tables: %s", ", ".join(table_names))
+
     etl = ETLPipeline()
-    success = etl.test_extract(queries)
-    
-    # Option 2: Run full ETL pipeline with column mapping (uncomment to use)
-    success = etl.run_etl_with_mapping(queries, table_names, conflict_columns_list, column_mappings, update_columns_list)
+    if args.extract_only:
+        success = etl.test_extract(queries)
+    else:
+        success = etl.run_etl_with_mapping(
+            queries,
+            table_names,
+            conflict_columns_list,
+            column_mappings,
+            update_columns_list,
+        )
     
     if success:
         logger.info("Process completed successfully!")
