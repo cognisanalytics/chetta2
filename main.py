@@ -25,10 +25,14 @@ DEFAULT_SOURCE_DATABASE = "Chetta"
 DEFAULT_SOURCE_SCHEMA = "dbo"
 SOURCE_TABLES = [
     "Chetta.dbo.consArticulos",
+    "Chetta.dbo.consAsignaciones",
     "Chetta.dbo.consAutSalidas",
+    "Chetta.dbo.consAutos",
     "Chetta.dbo.consClientes",
     "Chetta.dbo.consCotizacion",
+    "Chetta.dbo.consDetAsignaciones",
     "Chetta.dbo.consEmpleados",
+    "Chetta.dbo.consFcComAut",
     "Chetta.dbo.consFeriados",
     "Chetta.dbo.consGrados",
     "Chetta.dbo.consHistClinicas",
