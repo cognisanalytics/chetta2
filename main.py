@@ -52,7 +52,6 @@ SOURCE_TABLES = [
     "Chetta.dbo.consVenDetItm",
     "Chetta.dbo.consVenKit",
     "Chetta.dbo.consVentas",
-    "Chetta.dbo.consAutos",
 ]
 
 
