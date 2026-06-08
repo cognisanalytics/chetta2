@@ -52,6 +52,7 @@ SOURCE_TABLES = [
     "Chetta.dbo.consVenDetItm",
     "Chetta.dbo.consVenKit",
     "Chetta.dbo.consVentas",
+    "Chetta.dbo.consAutos",
 ]
 
 
@@ -247,11 +248,11 @@ class ETLPipeline:
                 self.logger.error("ETL Pipeline failed during load stage")
                 return False
                 
-        except Exception as e:
+        except Exception:
             self._log_dlt_load(load_id, status=1)
-            self.logger.error(f"ETL Pipeline failed: {str(e)}")
+            self.logger.error("ETL Pipeline failed", exc_info=True)
             return False
-    
+
     def run_etl_with_mapping(self, queries: List[str], 
                             table_names: List[str],
                             conflict_columns_list: List[List[str]],
@@ -285,34 +286,42 @@ class ETLPipeline:
                 raise ValueError("Number of queries must match number of column mappings")
             
             # Simple and memory-safe mode: process one table at a time.
-            success = True
+            failed_tables: List[str] = []
             with self.extractor as extractor, self.loader as loader:
                 for i, (query, table_name) in enumerate(zip(queries, table_names), start=1):
                     self.logger.info("=== TABLE %s/%s: %s ===", i, len(table_names), table_name)
-                    self.logger.info("=== STAGE 1: EXTRACT ===")
-                    extracted_df = extractor.execute_query(query)
+                    try:
+                        self.logger.info("=== STAGE 1: EXTRACT ===")
+                        extracted_df = extractor.execute_query(query)
 
-                    self.logger.info("=== STAGE 2: TRANSFORM ===")
-                    mapping = column_mappings[i - 1] if i - 1 < len(column_mappings) else {}
-                    transformed_df = self.transformer.transform_data(extracted_df, mapping)
+                        self.logger.info("=== STAGE 2: TRANSFORM ===")
+                        mapping = column_mappings[i - 1] if i - 1 < len(column_mappings) else {}
+                        transformed_df = self.transformer.transform_data(extracted_df, mapping)
 
-                    self.logger.info("=== STAGE 3: LOAD ===")
-                    if not loader.delete_and_insert_data(transformed_df, table_name):
-                        success = False
-                        break
-            
-            if success:
+                        self.logger.info("=== STAGE 3: LOAD ===")
+                        if not loader.delete_and_insert_data(transformed_df, table_name):
+                            self.logger.error("Load failed for table %s, skipping", table_name)
+                            failed_tables.append(table_name)
+                    except Exception:
+                        self.logger.error("Table %s failed, skipping", table_name, exc_info=True)
+                        failed_tables.append(table_name)
+
+            if not failed_tables:
                 self._log_dlt_load(load_id, status=0)
                 self.logger.info("ETL Pipeline with Column Mapping completed successfully!")
                 return True
             else:
                 self._log_dlt_load(load_id, status=1)
-                self.logger.error("ETL Pipeline failed during load stage")
+                self.logger.warning(
+                    "ETL completed with %d failed table(s): %s",
+                    len(failed_tables),
+                    ", ".join(failed_tables),
+                )
                 return False
-                
-        except Exception as e:
+
+        except Exception:
             self._log_dlt_load(load_id, status=1)
-            self.logger.error(f"ETL Pipeline failed: {str(e)}")
+            self.logger.error("ETL Pipeline failed", exc_info=True)
             return False
 
 def main():
